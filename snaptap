@@ -1,0 +1,64 @@
+#!/usr/bin/env python
+import getopt
+import logging
+import os
+import sys
+import time
+
+import daemon
+from pidfile import PidFile
+
+LOG_PATH = "/var/log/snaptap.log"
+LOG_FORMAT = "%(asctime)-15s %(levelname)s %(message)s"
+PID_PATH = "/var/run/snaptap.pid"
+
+
+def main(interval, debug=False):
+    logging.info("Started")
+    while True:
+        time.sleep(interval)
+        logging.debug("Fetching new data")
+
+
+if __name__ == "__main__":
+    try:
+        opts, args = getopt.getopt(
+            sys.argv[1:], "fi:d", ["foreground", "interval=", "debug"])
+    except getopt.GetoptError, error:
+        print str(error)
+        sys.exit(1)
+    debug = False
+    foreground = False
+    interval = None
+    for option, arg in opts:
+        if option in ("-f", "--foreground"):
+            foreground = True
+        elif option in ("-i", "--interval"):
+            try:
+                interval = int(arg)
+            except ValueError:
+                print "Invalid interval (should be a number)", arg
+                sys.exit(1)
+        elif option in ("-d", "--debug"):
+            debug = True
+    assert interval is not None, "Interval not given"
+    if debug == True:
+        logging_level = logging.DEBUG
+    else:
+        logging_level = logging.INFO
+    if not foreground:
+        if not os.access(os.path.dirname(PID_PATH), os.W_OK):
+            print "Can't create the PID file at ", PID_PATH
+            sys.exit(1)
+        if not os.access(os.path.dirname(LOG_PATH), os.W_OK):
+            print "Can't access the logging path: ", LOG_PATH
+            sys.exit(1)
+        with daemon.DaemonContext(pidfile=PidFile(PID_PATH)):
+            logging.basicConfig(
+                filename=LOG_PATH, format=LOG_FORMAT, level=logging_level)
+            main(interval, debug)
+    else:
+        logging.basicConfig(
+            stream=sys.stdout, format=LOG_FORMAT, level=logging_level)
+        main(interval, debug)
+

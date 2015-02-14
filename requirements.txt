@@ -1,0 +1,4 @@
+docutils==0.12
+lockfile==0.10.2
+pidfile==0.1.0
+python-daemon==2.0.5
