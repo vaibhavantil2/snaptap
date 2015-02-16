@@ -1,35 +1,102 @@
 #!/usr/bin/env python
 import getopt
+import json
 import logging
 import os
 import sys
 import time
 
 import daemon
+import elasticsearch
+from elasticsearch import Elasticsearch
 from pidfile import PidFile
+from pycassa.pool import ConnectionPool
+from pycassa.columnfamily import ColumnFamily
+
 
 LOG_PATH = "/var/log/snaptap.log"
 LOG_FORMAT = "%(asctime)-15s %(levelname)s %(message)s"
 PID_PATH = "/var/run/snaptap.pid"
 
 
-def main(interval, debug=False):
+def main(mapping, interval, debug=False):
     logging.info("Started")
+    cs_cxns = {}
     while True:
         time.sleep(interval)
-        logging.debug("Fetching new data")
-
+        for cassandra_ep, es_ep in mapping["mapping"]:
+            keyspace, cf_name = cassandra_ep.split(".")
+            es_index, es_doctype = es_ep.split(".")
+            logging.debug(
+                "Syncing Cassandra [KS=%s CF=%s] > ES [INDEX=%s DOCTYPE=%s]"
+                % (keyspace, cf_name, es_index, es_doctype))
+            if not keyspace in cs_cxns:
+                cs_cxns[keyspace] = ConnectionPool(keyspace)
+            cf = ColumnFamily(cs_cxns[keyspace], cf_name)
+            es = Elasticsearch()
+            result = cf.get_range(include_timestamp=True)
+            for entry in result:
+                id, values = entry
+                fields = dict([(k, v[0]) for k, v in values.items()])
+                try:
+                    es_record = es.get(
+                        es_index, id, es_doctype, fields="_source,_timestamp")
+                except elasticsearch.NotFoundError:
+                    es.index(es_index, es_doctype, fields, id)
+                    logging.info("Record %s indexed on ES" % id)
+                else:
+                    es_ts = es_record["fields"]["_timestamp"] * 1000000
+                    cs_ts = max([t for val, t in values.values()])
+                    if es_ts > cs_ts:
+                        logging.info("Updating record %s on Cassandra: %r (%d)"
+                                     % (id, es_record["_source"], es_ts))
+                        cf.insert(id, es_record["_source"], es_ts)
+                    elif es_ts < cs_ts:
+                        logging.info("Updating record %s on ES: %r (%d)"
+                                     % (id, fields, cs_ts / 1000))
+                        es.index(es_index, es_doctype, fields, id, timestamp=cs_ts / 1000000)
+                    else:
+                        logging.info("Record %s has same timestamp on peers" % id)
+            result = es.search(index=es_index, doc_type=es_doctype,
+                               fields="_source,_timestamp", scroll="10m",
+                               search_type="scan")
+            while True:
+                result = es.scroll(scroll_id=result["_scroll_id"], scroll= "10m")
+                hits = result["hits"]["hits"]
+                if not hits:
+                    break
+                for entry in hits:
+                    cs_record = cf.get(entry["_id"], include_timestamp=True)
+                    fields = dict([(k, v[0]) for k, v in values.items()])
+                    cs_ts = max([t for val, t in values.values()])
+                    es_ts = entry["fields"]["_timestamp"] * 1000000
+                    if es_ts > cs_ts:
+                        logging.info(
+                            "Updating record %s on Cassandra" % entry["_id"])
+                        cf.insert(entry["_id"], entry["_source"], es_ts)
+                    elif es_ts < cs_ts:
+                        logging.info(
+                            "Updating record %s on ES: %r" % (entry["_id"], fields))
+                        es.index(es_index, es_doctype, fields, entry["_id"],
+                                 timestamp=cs_ts / 1000000)
+                    else:
+                        logging.info(
+                            "Record %s has same timestamp on peers" % entry["_id"])
+            logging.info("-" * 80)
+ 
 
 if __name__ == "__main__":
     try:
         opts, args = getopt.getopt(
-            sys.argv[1:], "fi:d", ["foreground", "interval=", "debug"])
+            sys.argv[1:], "fi:m:d",
+            ["foreground", "interval=", "mapping=", "debug"])
     except getopt.GetoptError, error:
         print str(error)
         sys.exit(1)
     debug = False
     foreground = False
     interval = None
+    mapping = None
     for option, arg in opts:
         if option in ("-f", "--foreground"):
             foreground = True
@@ -41,7 +108,18 @@ if __name__ == "__main__":
                 sys.exit(1)
         elif option in ("-d", "--debug"):
             debug = True
+        elif option in ("-m", "--mapping"):
+            mapping = arg
+
     assert interval is not None, "Interval not given"
+    assert mapping is not None, "Mapping file not given"
+    assert os.path.exists(mapping), "Mapping file doesn't exist"
+    assert os.access(mapping, os.R_OK), "Mapping file inacessible"
+    try:
+        mapping = json.loads(open(mapping).read())
+    except ValueError:
+        raise ValueError, "Can't parse mapping file"
+
     if debug == True:
         logging_level = logging.DEBUG
     else:
@@ -56,9 +134,9 @@ if __name__ == "__main__":
         with daemon.DaemonContext(pidfile=PidFile(PID_PATH)):
             logging.basicConfig(
                 filename=LOG_PATH, format=LOG_FORMAT, level=logging_level)
-            main(interval, debug)
+            main(mapping, interval, debug)
     else:
         logging.basicConfig(
             stream=sys.stdout, format=LOG_FORMAT, level=logging_level)
-        main(interval, debug)
+        main(mapping, interval, debug)
 

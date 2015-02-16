@@ -1,0 +1,5 @@
+{
+    "mapping": [
+       ["mykeyspace.users", "test.users"]
+    ]
+}
